@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-CYBREIGN_VERSION="1.1"
+CYBREIGN_VERSION="1.0"
 
 REPO="${CYBREIGN_REPO:-https://raw.githubusercontent.com/cybreign/cybreign-core/main}"
 TOOLS_JSON="${CYBREIGN_TOOLS_JSON:-$REPO/tools.json}"
