@@ -1,0 +1,14 @@
+Package: cybreign
+Version: 1.0
+Architecture: all
+Maintainer: Pidugu Likhil <pidugulikhil@gmail.com>
+Organization: CYBREIGN
+Section: utils
+Priority: optional
+Depends: bash, curl
+Installed-Size: 64
+Homepage: https://github.com/pidugulikhil/CYBREIGN
+Description: CYBREIGN Universal Tool Manager
+ Manage, install, update and remove CYBREIGN tools
+ across Termux, Ubuntu, Kali, Debian and other platforms.
+ Supports version pinning, rollback and multi-platform detection.
