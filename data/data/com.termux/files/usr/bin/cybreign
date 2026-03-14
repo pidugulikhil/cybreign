@@ -238,16 +238,16 @@ platform_supported() {
 }
 
 # FIX: get tool names from exactly the right indent level (tool-level "name" fields)
-#get_all_tool_names() {
-#      grep -E '^[[:space:]]{10}"name"[[:space:]]*:' "$TOOLS_CACHE" \
-#    | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
-#}
-
-#OR the permanent fix — stop hardcoding spaces entirely:
 get_all_tool_names() {
-  grep -E '^[[:space:]]+"name"[[:space:]]*:[[:space:]]*"[^0-9]' "$TOOLS_CACHE" \
+      grep -E '^[[:space:]]{10}"name"[[:space:]]*:' "$TOOLS_CACHE" \
     | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
 }
+
+#OR the permanent fix — stop hardcoding spaces entirely:
+#get_all_tool_names() {
+#  grep -E '^[[:space:]]+"name"[[:space:]]*:[[:space:]]*"[^0-9]' "$TOOLS_CACHE" \
+#    | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
+#}
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
