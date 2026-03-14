@@ -1,301 +1,698 @@
-#!/usr/bin/env bash
+#!/data/data/com.termux/files/usr/bin/bash
 
-CYBREIGN_VERSION="1.0"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CYBREIGN — Universal Tool Manager  v2.0
+#  Repo  : https://github.com/CYBREIGN/cybreign-core
+#  Codes : https://github.com/pidugulikhil
+# ═══════════════════════════════════════════════════════════════════════════════
 
-REPO="${CYBREIGN_REPO:-https://raw.githubusercontent.com/cybreign/cybreign-core/main}"
-TOOLS_JSON="${CYBREIGN_TOOLS_JSON:-$REPO/tools.json}"
+CYBREIGN_VERSION="2.0"
+
+REPO="${CYBREIGN_REPO:-https://raw.githubusercontent.com/CYBREIGN/cybreign-core/main}"
+TOOLS_JSON_URL="${CYBREIGN_TOOLS_JSON:-$REPO/tools.json}"
+
 WORKDIR="$HOME/.cybreign"
+CACHE="$WORKDIR/cache"
+INSTALLED_DB="$WORKDIR/installed.db"
+TOOLS_CACHE="$CACHE/tools.json"
+CACHE_TTL=3600
 
-mkdir -p "$WORKDIR"
+mkdir -p "$WORKDIR" "$CACHE"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[0;32m'
+  C_CYAN=$'\033[0;36m'
+  C_YELLOW=$'\033[0;33m'
+  C_RED=$'\033[0;31m'
+  C_BLUE=$'\033[0;34m'
+  C_DIM=$'\033[2m'
+else
+  C_RESET=''; C_BOLD=''; C_GREEN=''; C_CYAN=''
+  C_YELLOW=''; C_RED=''; C_BLUE=''; C_DIM=''
+fi
+
+msg()  { printf '%s[cybreign]%s %s\n'   "$C_CYAN"   "$C_RESET" "$1"; }
+ok()   { printf '%s[cybreign] %s%s %s\n' "$C_GREEN"  "✓" "$C_RESET" "$1"; }
+err()  { printf '%s[cybreign] %s%s %s\n' "$C_RED"    "✗" "$C_RESET" "$1" >&2; }
+warn() { printf '%s[cybreign] !%s %s\n' "$C_YELLOW" "$C_RESET" "$1"; }
+die()  { err "$1"; exit 1; }
+
+# ── Platform detection ────────────────────────────────────────────────────────
 
 detect_platform() {
-
-if [ -n "$PREFIX" ] && [ -d "$PREFIX/bin" ]; then
+  if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ]; then
     PLATFORM="termux"
+    PKG_INSTALL="dpkg -i"
+    PKG_REMOVE="dpkg -r"
 
-elif [ "$(uname)" = "Darwin" ]; then
+  elif [ "$(uname)" = "Darwin" ]; then
     PLATFORM="macos"
+    PKG_INSTALL=""
+    PKG_REMOVE=""
 
-elif grep -qi microsoft /proc/version 2>/dev/null; then
+  elif grep -qi microsoft /proc/version 2>/dev/null; then
     PLATFORM="wsl"
+    PKG_INSTALL="sudo dpkg -i"
+    PKG_REMOVE="sudo apt remove"
 
-elif [ -f /etc/os-release ]; then
+  elif [ -f /etc/os-release ]; then
     . /etc/os-release
-    PLATFORM="$ID"
+    PLATFORM="${ID:-linux}"
+    case "$PLATFORM" in
+      ubuntu|debian|kali|linuxmint|pop|elementary|zorin|raspbian)
+        PKG_INSTALL="sudo dpkg -i"
+        PKG_REMOVE="sudo apt remove"
+        ;;
+      fedora|rhel|centos|almalinux|rocky)
+        PKG_INSTALL="sudo rpm -i"
+        PKG_REMOVE="sudo rpm -e"
+        ;;
+      arch|manjaro|endeavouros)
+        PKG_INSTALL="sudo pacman -U"
+        PKG_REMOVE="sudo pacman -R"
+        ;;
+      opensuse*|sles)
+        PKG_INSTALL="sudo zypper install"
+        PKG_REMOVE="sudo zypper remove"
+        ;;
+      *)
+        PKG_INSTALL="sudo dpkg -i"
+        PKG_REMOVE="sudo dpkg -r"
+        ;;
+    esac
 
-else
+  else
     PLATFORM="unknown"
-fi
+    PKG_INSTALL="dpkg -i"
+    PKG_REMOVE="dpkg -r"
+  fi
 
+  export PLATFORM PKG_INSTALL PKG_REMOVE
 }
 
-print_header() {
-
-echo "CYBREIGN Tool Manager"
-echo "Version: $CYBREIGN_VERSION"
-echo "Platform: $PLATFORM"
-echo
-
-}
-
-show_help() {
-
-print_header
-
-cat <<EOF
-
-Usage:
-  cybreign list
-  cybreign search <name>
-  cybreign install <tool> [--version X]
-  cybreign uninstall <tool>
-  cybreign info <tool>
-  cybreign update
-  cybreign update <tool>
-
-Examples:
-  cybreign install javix
-  cybreign install javix --version 1.0
-  cybreign search java
-  cybreign update javix
-
-EOF
-
-}
+# ── tools.json fetch ──────────────────────────────────────────────────────────
 
 fetch_tools() {
+  local force="${1:-}"
+  local now age
 
-curl -fsSL "$TOOLS_JSON" -o "$WORKDIR/tools.json" || {
-  echo "Failed to download tool database"
-  exit 1
+  if [ "$force" != "--force" ] && [ -f "$TOOLS_CACHE" ]; then
+    now=$(date +%s)
+    age=$(( now - $(date -r "$TOOLS_CACHE" +%s 2>/dev/null || echo 0) ))
+    if [ "$age" -lt "$CACHE_TTL" ]; then
+      return 0
+    fi
+  fi
+
+  msg "syncing tool database..."
+  if curl -fsSL "$TOOLS_JSON_URL" -o "$TOOLS_CACHE" 2>/dev/null; then
+    ok "tool database synced"
+  else
+    if [ -f "$TOOLS_CACHE" ]; then
+      warn "network unavailable — using cached database"
+      return 0
+    fi
+    die "failed to download tool database from $TOOLS_JSON_URL"
+  fi
 }
 
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+
+# FIX: match tool by line pattern (not hardcoded depth==2 which was wrong)
+get_tool_json() {
+  local tool="$1"
+  awk -v t="\"${tool}\"" '
+    BEGIN { found=0; depth=0; buf="" }
+    {
+      if (!found && $0 ~ ("^[[:space:]]*" t "[[:space:]]*:[[:space:]]*\\{")) {
+        found=1
+      }
+      if (found) {
+        buf = buf $0 "\n"
+        for (i=1; i<=length($0); i++) {
+          c = substr($0,i,1)
+          if (c=="{") depth++
+          if (c=="}") {
+            depth--
+            if (depth==0) { print buf; exit }
+          }
+        }
+      }
+    }
+  ' "$TOOLS_CACHE"
 }
 
-extract_tool_block() {
-
-awk -v tool="$1" '
-BEGIN { RS="}"; ORS="" }
-$0 ~ "\"name\"[[:space:]]*:[[:space:]]*\"" tool "\"" {
-  gsub(/^[[:space:]]*,?[[:space:]]*\{?[[:space:]]*/, "{", $0)
-  print $0 "}"
-  exit
-}
-' "$WORKDIR/tools.json"
-
+json_get() {
+  local field="$1"
+  local text="${2:-$(cat)}"
+  printf '%s' "$text" \
+    | tr '\n' ' ' \
+    | grep -oE "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+    | head -1 \
+    | sed 's/.*:[[:space:]]*"\(.*\)"/\1/'
 }
 
-json_field() {
-
-FIELD="$1"
-BLOCK="$2"
-
-printf '%s\n' "$BLOCK" \
-  | tr '\n' ' ' \
-  | sed -nE "s/.*\"${FIELD}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" \
-  | head -n 1
-
+get_versions() {
+  local tool_block="$1"
+  printf '%s' "$tool_block" \
+    | grep -oE '"[0-9]+\.[0-9][^"]*"[[:space:]]*:[[:space:]]*\{' \
+    | grep -oE '"[0-9]+\.[0-9][^"]*"' \
+    | tr -d '"'
 }
+
+# FIX: match version block by line pattern (not hardcoded depth==1)
+get_version_field() {
+  local tool_block="$1"
+  local version="$2"
+  local field="$3"
+
+  local vblock
+  vblock=$(printf '%s' "$tool_block" | awk -v v="\"${version}\"" '
+    BEGIN { found=0; depth=0; buf="" }
+    {
+      if (!found && $0 ~ ("^[[:space:]]*" v "[[:space:]]*:[[:space:]]*\\{")) {
+        found=1
+      }
+      if (found) {
+        buf = buf $0 "\n"
+        for (i=1; i<=length($0); i++) {
+          c = substr($0,i,1)
+          if (c=="{") depth++
+          if (c=="}") {
+            depth--
+            if (depth==0) { print buf; exit }
+          }
+        }
+      }
+    }
+  ')
+  json_get "$field" "$vblock"
+}
+
+# ── Installed DB ──────────────────────────────────────────────────────────────
+
+installed_get() {
+  local tool="$1"
+  [ -f "$INSTALLED_DB" ] || { echo ""; return; }
+  grep "^${tool}=" "$INSTALLED_DB" 2>/dev/null | cut -d= -f2 | head -1
+}
+
+installed_set() {
+  local tool="$1" version="$2"
+  touch "$INSTALLED_DB"
+  local tmp
+  tmp=$(grep -v "^${tool}=" "$INSTALLED_DB" 2>/dev/null || true)
+  printf '%s\n' "$tmp" | grep -v '^$' > "$INSTALLED_DB"
+  echo "${tool}=${version}" >> "$INSTALLED_DB"
+}
+
+installed_remove() {
+  local tool="$1"
+  touch "$INSTALLED_DB"
+  local tmp
+  tmp=$(grep -v "^${tool}=" "$INSTALLED_DB" 2>/dev/null || true)
+  printf '%s\n' "$tmp" | grep -v '^$' > "$INSTALLED_DB"
+}
+
+installed_list() {
+  [ -f "$INSTALLED_DB" ] || return 0
+  grep -v '^$' "$INSTALLED_DB" 2>/dev/null || true
+}
+
+# ── Platform support check ────────────────────────────────────────────────────
 
 platform_supported() {
-
-SUPPORTED="$1"
-
-case "$SUPPORTED" in
-  ""|all|any)
-    return 0
-    ;;
-esac
-
-if [ "$SUPPORTED" = "$PLATFORM" ]; then
-  return 0
-fi
-
-printf '%s' "$SUPPORTED" \
-  | tr ',' '\n' \
-  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -Fx "$PLATFORM" >/dev/null 2>&1
-
+  local supported="$1"
+  case "$supported" in
+    ""|all|any) return 0 ;;
+  esac
+  printf '%s' "$supported" \
+    | tr '[],"' ' ' \
+    | tr ' ' '\n' \
+    | sed '/^[[:space:]]*$/d' \
+    | grep -Fx "$PLATFORM" >/dev/null 2>&1
 }
 
-list_tools() {
+# FIX: get tool names from exactly the right indent level (tool-level "name" fields)
+#get_all_tool_names() {
+#      grep -E '^[[:space:]]{10}"name"[[:space:]]*:' "$TOOLS_CACHE" \
+#    | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
+#}
 
-fetch_tools
-
-grep '"name"' "$WORKDIR/tools.json" | cut -d '"' -f4
-
+#OR the permanent fix — stop hardcoding spaces entirely:
+get_all_tool_names() {
+  grep -E '^[[:space:]]+"name"[[:space:]]*:[[:space:]]*"[^0-9]' "$TOOLS_CACHE" \
+    | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
 }
 
-search_tool() {
+# ── Commands ──────────────────────────────────────────────────────────────────
 
-fetch_tools
+cmd_list() {
+  fetch_tools
+  printf "\n%sAvailable Tools%s\n" "$C_BOLD" "$C_RESET"
+  printf "%s%-18s %-8s %-14s %s%s\n" "$C_DIM" "NAME" "LATEST" "INSTALLED" "DESCRIPTION" "$C_RESET"
+  printf "%s%-18s %-8s %-14s %s%s\n" "$C_DIM" "----" "------" "---------" "-----------" "$C_RESET"
 
-grep -i "$1" "$WORKDIR/tools.json"
+  get_all_tool_names | while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    local block latest desc installed inst_display
+    block=$(get_tool_json "$name")
+    [ -z "$block" ] && continue
+    latest=$(json_get "latest" "$block")
+    desc=$(json_get "description" "$block")
+    installed=$(installed_get "$name")
 
+    if [ -z "$installed" ]; then
+      inst_display="${C_DIM}-${C_RESET}"
+    elif [ "$installed" = "$latest" ]; then
+      inst_display="${C_GREEN}v${installed}${C_RESET}"
+    else
+      inst_display="${C_YELLOW}v${installed}${C_RESET}"
+    fi
+
+    printf "  %s%-16s%s %s%-8s%s %-14s %s\n" \
+      "$C_CYAN" "$name" "$C_RESET" \
+      "$C_CYAN" "v$latest" "$C_RESET" \
+      "$inst_display" "$desc"
+  done
+  echo
 }
 
-tool_info() {
+cmd_search() {
+  local query="${1:-}"
+  [ -z "$query" ] && die "usage: cybreign search <query>"
+  fetch_tools
 
-TOOL_BLOCK=""
+  printf "\n%sSearch: %s%s\n\n" "$C_BOLD" "$query" "$C_RESET"
 
-fetch_tools
-TOOL_BLOCK="$(extract_tool_block "$1")"
-
-if [ -z "$TOOL_BLOCK" ]; then
-  echo "Tool not found: $1"
-  exit 1
-fi
-
-printf '%s\n' "$TOOL_BLOCK"
-
+  local found=0
+  get_all_tool_names | while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    if printf '%s' "$name" | grep -qi "$query" 2>/dev/null; then
+      local block latest desc
+      block=$(get_tool_json "$name")
+      latest=$(json_get "latest" "$block")
+      desc=$(json_get "description" "$block")
+      printf "  %s%-18s%s v%-6s  %s\n" "$C_CYAN" "$name" "$C_RESET" "$latest" "$desc"
+      found=1
+    fi
+  done
+  echo
 }
 
-install_tool() {
+cmd_info() {
+  local tool="${1:-}"
+  [ -z "$tool" ] && die "usage: cybreign info <tool>"
+  fetch_tools
 
-TOOL="$1"
-VERSION="$2"
+  local block
+  block=$(get_tool_json "$tool")
+  [ -z "$block" ] && die "tool not found: $tool"
 
-if [ -z "$TOOL" ]; then
-  echo "Tool name required"
-  exit 1
-fi
+  local latest desc maintainer org homepage supported installed
+  latest=$(json_get "latest" "$block")
+  desc=$(json_get "description" "$block")
+  maintainer=$(json_get "maintainer" "$block")
+  org=$(json_get "organization" "$block")
+  homepage=$(json_get "homepage" "$block")
+  supported=$(json_get "supported" "$block")
+  installed=$(installed_get "$tool")
 
-fetch_tools
+  printf "\n%s%s%s\n" "$C_BOLD$C_CYAN" "$tool" "$C_RESET"
+  printf "  Description  : %s\n" "$desc"
+  printf "  Latest       : %sv%s%s\n" "$C_GREEN" "$latest" "$C_RESET"
+  if [ -n "$installed" ]; then
+    printf "  Installed    : %sv%s%s\n" "$C_YELLOW" "$installed" "$C_RESET"
+  else
+    printf "  Installed    : %s(not installed)%s\n" "$C_DIM" "$C_RESET"
+  fi
+  [ -n "$maintainer" ] && printf "  Maintainer   : %s\n" "$maintainer"
+  [ -n "$org" ]        && printf "  Organization : %s\n" "$org"
+  [ -n "$homepage" ]   && printf "  Homepage     : %s\n" "$homepage"
+  printf "  Platforms    : %s\n" "$supported"
 
-TOOL_BLOCK="$(extract_tool_block "$TOOL")"
+  printf "\n  %sVersions:%s\n" "$C_BOLD" "$C_RESET"
+  get_versions "$block" | while IFS= read -r v; do
+    [ -z "$v" ] && continue
+    local changelog vdate marker
+    changelog=$(get_version_field "$block" "$v" "changelog")
+    vdate=$(get_version_field "$block" "$v" "date")
+    marker=""
+    [ "$v" = "$latest" ]    && marker="${marker} ${C_GREEN}(latest)${C_RESET}"
+    [ "$v" = "$installed" ] && marker="${marker} ${C_YELLOW}(installed)${C_RESET}"
+    printf "    %sv%s%s%s  --  %s  [%s]\n" \
+      "$C_CYAN" "$v" "$C_RESET" "$marker" "$changelog" "$vdate"
+  done
+  echo
+}
 
-if [ -z "$TOOL_BLOCK" ]; then
-  echo "Tool not found: $TOOL"
-  exit 1
-fi
+cmd_versions() {
+  local tool="${1:-}"
+  [ -z "$tool" ] && die "usage: cybreign versions <tool>"
+  fetch_tools
 
-SUPPORTED="$(json_field platform "$TOOL_BLOCK")"
+  local block
+  block=$(get_tool_json "$tool")
+  [ -z "$block" ] && die "tool not found: $tool"
 
-if [ -z "$SUPPORTED" ]; then
-  SUPPORTED="$(json_field supported "$TOOL_BLOCK")"
-fi
+  local latest installed
+  latest=$(json_get "latest" "$block")
+  installed=$(installed_get "$tool")
 
-if ! platform_supported "$SUPPORTED"; then
-  echo "Tool not supported on this platform"
-  echo "Supported: $SUPPORTED"
-  exit 1
-fi
+  printf "\n%sVersions of %s:%s\n\n" "$C_BOLD" "$tool" "$C_RESET"
 
-PACKAGE_URL="$(json_field package "$TOOL_BLOCK")"
+  get_versions "$block" | while IFS= read -r v; do
+    [ -z "$v" ] && continue
+    local changelog vdate tag
+    changelog=$(get_version_field "$block" "$v" "changelog")
+    vdate=$(get_version_field "$block" "$v" "date")
+    tag=""
+    [ "$v" = "$latest" ]    && tag="${tag}${C_GREEN}[latest]${C_RESET} "
+    [ "$v" = "$installed" ] && tag="${tag}${C_YELLOW}[installed]${C_RESET} "
+    printf "  %s%sv%s%s  %s  (%s)\n" \
+      "$tag" "$C_CYAN" "$v" "$C_RESET" "$changelog" "$vdate"
+  done
+  echo
+}
 
-if [ -n "$VERSION" ] && [ -n "$PACKAGE_URL" ]; then
-  PACKAGE_DIR="${PACKAGE_URL%/*}"
-  PACKAGE_URL="$PACKAGE_DIR/${TOOL}_${VERSION}.deb"
-fi
+cmd_install() {
+  local tool="${1:-}"
+  local version="${2:-}"
+  [ -z "$tool" ] && die "usage: cybreign install <tool> [version]"
 
-if [ -z "$PACKAGE_URL" ]; then
-  CATEGORY="$(json_field category "$TOOL_BLOCK")"
+  fetch_tools
 
-  if [ -z "$CATEGORY" ]; then
-    echo "Package metadata missing for $TOOL"
+  local block
+  block=$(get_tool_json "$tool")
+  [ -z "$block" ] && die "tool not found: $tool"
+
+  local supported
+  supported=$(json_get "supported" "$block")
+  if ! platform_supported "$supported"; then
+    err "tool '$tool' not supported on: $PLATFORM"
+    warn "supported: $supported"
     exit 1
   fi
 
-  if [ -n "$VERSION" ]; then
-    FILE="${TOOL}_${VERSION}.deb"
-  else
-    FILE="${TOOL}.deb"
+  local latest
+  latest=$(json_get "latest" "$block")
+  [ -z "$version" ] && version="$latest"
+
+  local deb_url
+  deb_url=$(get_version_field "$block" "$version" "deb")
+  if [ -z "$deb_url" ]; then
+    err "version '$version' not found for $tool"
+    warn "available versions:"
+    get_versions "$block" | while IFS= read -r v; do
+      [ -n "$v" ] && printf "    v%s\n" "$v"
+    done
+    exit 1
   fi
 
-  PACKAGE_URL="$REPO/packages/$CATEGORY/$TOOL/$FILE"
-fi
+  local current
+  current=$(installed_get "$tool")
+  if [ "$current" = "$version" ]; then
+    ok "$tool v$version is already installed"
+    return
+  fi
 
-PACKAGE_FILE="$WORKDIR/${PACKAGE_URL##*/}"
+  msg "installing ${tool} v${version}..."
+  [ -n "$current" ] && warn "replacing v$current with v$version"
 
-echo "Downloading $TOOL..."
+  local deb_file="$CACHE/${tool}_v${version}.deb"
+  msg "downloading..."
+  curl -fsSL --progress-bar "$deb_url" -o "$deb_file" || die "download failed"
 
-curl -fsSL "$PACKAGE_URL" -o "$PACKAGE_FILE" || {
-  echo "Download failed"
-  exit 1
+  msg "installing package..."
+  if [ "$PLATFORM" = "termux" ]; then
+    dpkg -i "$deb_file" || die "dpkg install failed"
+  else
+    eval "$PKG_INSTALL '$deb_file'" || die "install failed"
+  fi
+
+  installed_set "$tool" "$version"
+  ok "installed ${tool} v${version}"
+  [ "$version" != "$latest" ] && warn "note: v$latest is the latest available"
 }
 
-echo "Installing $TOOL..."
+cmd_uninstall() {
+  local tool="${1:-}"
+  [ -z "$tool" ] && die "usage: cybreign uninstall <tool>"
 
-dpkg -i "$PACKAGE_FILE"
+  local current
+  current=$(installed_get "$tool")
+  [ -z "$current" ] && warn "$tool not tracked by cybreign (attempting removal anyway)"
 
+  msg "uninstalling $tool..."
+  if [ "$PLATFORM" = "termux" ]; then
+    dpkg -r "$tool" 2>/dev/null || apt remove -y "$tool" 2>/dev/null \
+      || warn "package removal failed — may need manual cleanup"
+  else
+    eval "$PKG_REMOVE '$tool'" 2>/dev/null \
+      || warn "package removal failed — may need manual cleanup"
+  fi
+
+  installed_remove "$tool"
+  ok "$tool removed"
 }
 
-uninstall_tool() {
+cmd_update() {
+  local tool="${1:-}"
 
-TOOL="$1"
+  if [ -z "$tool" ]; then
+    msg "checking for cybreign updates..."
+    local remote_ver
+    remote_ver=$(curl -fsSL "$REPO/cybreign" 2>/dev/null \
+      | grep '^CYBREIGN_VERSION=' | head -1 | tr -d '"' | cut -d= -f2)
 
-if [ -z "$TOOL" ]; then
-  echo "Tool name required"
-  exit 1
-fi
+    if [ -n "$remote_ver" ] && [ "$remote_ver" = "$CYBREIGN_VERSION" ]; then
+      ok "cybreign v$CYBREIGN_VERSION is already up to date"
+      return
+    fi
+    [ -n "$remote_ver" ] && msg "updating: v$CYBREIGN_VERSION -> v$remote_ver"
+    curl -fsSL "$REPO/install.sh" | bash
+    return
+  fi
 
-apt remove "$TOOL"
+  fetch_tools
+  local block latest current
+  block=$(get_tool_json "$tool")
+  [ -z "$block" ] && die "tool not found: $tool"
 
+  latest=$(json_get "latest" "$block")
+  current=$(installed_get "$tool")
+
+  if [ -z "$current" ]; then
+    warn "$tool not installed — installing latest (v$latest)"
+    cmd_install "$tool"
+    return
+  fi
+
+  if [ "$current" = "$latest" ]; then
+    ok "$tool v$latest is already up to date"
+    return
+  fi
+
+  msg "updating $tool: v$current -> v$latest"
+  cmd_install "$tool" "$latest"
 }
 
-update_tool() {
+cmd_upgrade_all() {
+  fetch_tools
+  msg "checking all installed tools for updates..."
 
-TOOL="$1"
-
-if [ -z "$TOOL" ]; then
-  echo "Tool name required"
-  exit 1
-fi
-
-install_tool "$TOOL"
-
+  installed_list | while IFS='=' read -r tool version; do
+    [ -z "$tool" ] && continue
+    local block latest
+    block=$(get_tool_json "$tool")
+    if [ -z "$block" ]; then
+      warn "$tool not in database — skipping"
+      continue
+    fi
+    latest=$(json_get "latest" "$block")
+    if [ "$version" != "$latest" ]; then
+      msg "$tool: v$version -> v$latest"
+      cmd_install "$tool" "$latest"
+    else
+      ok "$tool v$version is up to date"
+    fi
+  done
 }
 
-update_core() {
+cmd_rollback() {
+  local tool="${1:-}"
+  local version="${2:-}"
+  [ -z "$tool" ] && die "usage: cybreign rollback <tool> [version]"
 
-echo "Updating CYBREIGN core..."
+  fetch_tools
+  local block current
+  block=$(get_tool_json "$tool")
+  [ -z "$block" ] && die "tool not found: $tool"
+  current=$(installed_get "$tool")
 
-curl -fsSL "$REPO/install.sh" | bash
+  if [ -z "$version" ]; then
+    local prev=""
+    local target=""
+    get_versions "$block" | while IFS= read -r v; do
+      [ -z "$v" ] && continue
+      if [ "$v" = "$current" ] && [ -n "$prev" ]; then
+        target="$prev"
+        break
+      fi
+      prev="$v"
+    done
+    target=$(get_versions "$block" | awk -v cur="$current" '
+      prev != "" && $0 == cur { print prev; exit }
+      { prev=$0 }
+    ')
+    if [ -z "$target" ]; then
+      die "no previous version available for rollback"
+    fi
+    version="$target"
+  fi
 
+  msg "rolling back $tool: v$current -> v$version"
+  cmd_install "$tool" "$version"
 }
+
+cmd_installed() {
+  printf "\n%sInstalled Tools%s\n" "$C_BOLD" "$C_RESET"
+  printf "%s%-18s %s%s\n" "$C_DIM" "NAME" "VERSION" "$C_RESET"
+  printf "%s%-18s %s%s\n" "$C_DIM" "----" "-------" "$C_RESET"
+
+  if [ ! -s "$INSTALLED_DB" ]; then
+    printf "  %s(none)%s\n" "$C_DIM" "$C_RESET"
+  else
+    installed_list | while IFS='=' read -r tool version; do
+      [ -z "$tool" ] && continue
+      printf "  %s%-16s%s %sv%s%s\n" \
+        "$C_CYAN" "$tool" "$C_RESET" "$C_GREEN" "$version" "$C_RESET"
+    done
+  fi
+  echo
+}
+
+cmd_sync() {
+  fetch_tools --force
+}
+
+cmd_clean() {
+  msg "cleaning download cache..."
+  rm -f "$CACHE"/*.deb
+  ok "cache cleared"
+}
+
+cmd_doctor() {
+  printf "\n%sCYBREIGN Doctor%s\n\n" "$C_BOLD" "$C_RESET"
+  printf "  Platform   : %s%s%s\n"  "$C_CYAN"   "$PLATFORM"      "$C_RESET"
+  printf "  PKG cmd    : %s\n"      "$PKG_INSTALL"
+  printf "  Workdir    : %s\n"      "$WORKDIR"
+  printf "  Tools URL  : %s\n"      "$TOOLS_JSON_URL"
+  printf "  Installed  : %s\n"      "$INSTALLED_DB"
+  echo
+
+  _chk() {
+    if command -v "$1" >/dev/null 2>&1; then
+      printf "  %s+%s %-10s found\n"         "$C_GREEN"  "$C_RESET" "$1"
+    else
+      printf "  %s-%s %-10s not found%s\n"   "$C_RED"    "$C_RESET" "$1" "$C_RESET"
+    fi
+  }
+  printf "  %sDependencies:%s\n" "$C_BOLD" "$C_RESET"
+  _chk curl; _chk dpkg; _chk awk; _chk grep; _chk sed
+  echo
+
+  printf "  %sCache:%s\n" "$C_BOLD" "$C_RESET"
+  if [ -f "$TOOLS_CACHE" ]; then
+    local age
+    age=$(( $(date +%s) - $(date -r "$TOOLS_CACHE" +%s 2>/dev/null || echo 0) ))
+    printf "  %s+%s tools.json  %ds old  (%s)\n" "$C_GREEN" "$C_RESET" "$age" "$TOOLS_CACHE"
+  else
+    printf "  %s!%s tools.json not cached yet — run: cybreign sync\n" "$C_YELLOW" "$C_RESET"
+  fi
+  echo
+
+  printf "  %sInstalled tools:%s\n" "$C_BOLD" "$C_RESET"
+  if [ -s "$INSTALLED_DB" ]; then
+    installed_list | while IFS='=' read -r t v; do
+      printf "    %s%s%s  v%s\n" "$C_CYAN" "$t" "$C_RESET" "$v"
+    done
+  else
+    printf "  %s(none)%s\n" "$C_DIM" "$C_RESET"
+  fi
+  echo
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+show_help() {
+  printf "\n%s%sCYBREIGN%s Tool Manager  v%s  [%s%s%s]\n\n" \
+    "$C_BOLD" "$C_CYAN" "$C_RESET" \
+    "$CYBREIGN_VERSION" \
+    "$C_CYAN" "$PLATFORM" "$C_RESET"
+
+  printf "%sPackage commands:%s\n" "$C_BOLD" "$C_RESET"
+  printf "  %-36s %s\n" "install  <tool> [version]"  "Install a tool (latest if no version)"
+  printf "  %-36s %s\n" "uninstall <tool>"            "Remove a tool"
+  printf "  %-36s %s\n" "update [tool]"               "Update tool or cybreign itself"
+  printf "  %-36s %s\n" "upgrade"                     "Upgrade ALL installed tools"
+  printf "  %-36s %s\n" "rollback <tool> [version]"   "Roll back to previous or specific version"
+  echo
+
+  printf "%sInfo commands:%s\n" "$C_BOLD" "$C_RESET"
+  printf "  %-36s %s\n" "list"              "List all available tools"
+  printf "  %-36s %s\n" "installed"         "Show what is installed"
+  printf "  %-36s %s\n" "search <query>"    "Search tools by name"
+  printf "  %-36s %s\n" "info <tool>"       "Full details + all versions"
+  printf "  %-36s %s\n" "versions <tool>"   "List all versions of a tool"
+  echo
+
+  printf "%sMaintenance:%s\n" "$C_BOLD" "$C_RESET"
+  printf "  %-36s %s\n" "sync"    "Force re-sync tool database"
+  printf "  %-36s %s\n" "clean"   "Clear download cache"
+  printf "  %-36s %s\n" "doctor"  "Check environment and dependencies"
+  echo
+
+  printf "%sExamples:%s\n" "$C_BOLD" "$C_RESET"
+  printf "  cybreign install javix           %s# latest%s\n"           "$C_DIM" "$C_RESET"
+  printf "  cybreign install javix 1.0       %s# specific version%s\n" "$C_DIM" "$C_RESET"
+  printf "  cybreign rollback javix          %s# one version back%s\n" "$C_DIM" "$C_RESET"
+  printf "  cybreign rollback javix 1.0      %s# exact version%s\n"    "$C_DIM" "$C_RESET"
+  printf "  cybreign upgrade                 %s# upgrade all%s\n"       "$C_DIM" "$C_RESET"
+  printf "  cybreign versions javix          %s# show versions%s\n"    "$C_DIM" "$C_RESET"
+  printf "  cybreign info javix              %s# full details%s\n"     "$C_DIM" "$C_RESET"
+  echo
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 detect_platform
 
-case "$1" in
-
-list)
-list_tools
-;;
-
-search)
-search_tool "$2"
-;;
-
-install)
-if [ "$3" = "--version" ]; then
-  install_tool "$2" "$4"
-else
-  install_tool "$2"
-fi
-;;
-
-uninstall)
-uninstall_tool "$2"
-;;
-
-info)
-tool_info "$2"
-;;
-
-update)
-if [ -z "$2" ]; then
-  update_core
-else
-  update_tool "$2"
-fi
-;;
-
-help)
-show_help
-;;
-
-*)
-show_help
-;;
-
+case "${1:-}" in
+  install)
+    if [ "${3:-}" = "--version" ] || [ "${3:-}" = "-v" ]; then
+      cmd_install "$2" "${4:-}"
+    else
+      cmd_install "$2" "${3:-}"
+    fi
+    ;;
+  uninstall|remove)  cmd_uninstall  "$2" ;;
+  update)            cmd_update     "${2:-}" ;;
+  upgrade)           cmd_upgrade_all ;;
+  rollback)          cmd_rollback   "$2" "${3:-}" ;;
+  list)              cmd_list ;;
+  installed)         cmd_installed ;;
+  search)            cmd_search     "$2" ;;
+  info)              cmd_info       "$2" ;;
+  versions)          cmd_versions   "$2" ;;
+  sync)              cmd_sync ;;
+  clean)             cmd_clean ;;
+  doctor)            cmd_doctor ;;
+  help|--help|-h)    show_help ;;
+  --version|-V)      printf "cybreign %s\n" "$CYBREIGN_VERSION" ;;
+  *)                 show_help ;;
 esac
